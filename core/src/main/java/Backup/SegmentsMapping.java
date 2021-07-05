@@ -6,9 +6,10 @@ import java.io.*;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.TreeSet;
 
 public class SegmentsMapping {
-    private static HashMap<TopicPartition, ArrayList<Long>> map;
+    private static HashMap<TopicPartition, TreeSet<Long>> map;
 
     //called when kafka is started.
     //Loading the map object from file if exist otherwise initialing the map.
@@ -18,14 +19,14 @@ public class SegmentsMapping {
             ObjectInputStream objectInputStream = new ObjectInputStream(fileInputStream);
             Object object = objectInputStream.readObject();
 
-            this.map = (HashMap<TopicPartition, ArrayList<Long>>) object;
+            this.map = (HashMap<TopicPartition, TreeSet<Long>>) object;
             objectInputStream.close();
             fileInputStream.close();
             System.out.println(map);
 
         } catch (FileNotFoundException e) {
             System.out.println("File is not exist. Hence initialising the map.");
-            this.map = new HashMap<TopicPartition,ArrayList<Long>>();
+            this.map = new HashMap<TopicPartition,TreeSet<Long>>();
         } catch (IOException e) {
             e.printStackTrace();
         } catch (ClassNotFoundException e) {
@@ -53,7 +54,7 @@ public class SegmentsMapping {
     //push the baseOffset into the baseOffset list of given topicPartition.
     public void addBaseOffset(TopicPartition tp, long baseOffset){
         if(map.get(tp)==null){
-            map.put(tp,new ArrayList<>());
+            map.put(tp,new TreeSet<>());
         }
         map.get(tp).add(baseOffset);
         System.out.println(map);
@@ -61,16 +62,17 @@ public class SegmentsMapping {
 
     //Return the baseOffset of the segment which contains the given offset of given TopicPartition.
     public long getBaseOffset(TopicPartition tp, long offset){
-        ArrayList<Long> baseOffsetList = map.get(tp);
-        int pos = Collections.binarySearch(baseOffsetList,offset);
-        if(pos>=0){
-            return baseOffsetList.get(pos);
-        }
-        else{
-            int index = (-1)*pos;
-            index = index - 2;
-
-            return baseOffsetList.get(index);
-        }
+//        ArrayList<Long> baseOffsetList = map.get(tp);
+//        int pos = Collections.binarySearch(baseOffsetList,offset);
+//        if(pos>=0){
+//            return baseOffsetList.get(pos);
+//        }
+//        else{
+//            int index = (-1)*pos;
+//            index = index - 2;
+//
+//            return baseOffsetList.get(index);
+//        }
+        return map.get(tp).floor(offset);
     }
 }
