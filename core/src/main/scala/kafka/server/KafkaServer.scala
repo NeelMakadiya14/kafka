@@ -17,6 +17,8 @@
 
 package kafka.server
 
+import Backup.S3BackUp
+
 import java.io.{File, IOException}
 import java.net.{InetAddress, SocketTimeoutException}
 import java.util.concurrent._
@@ -177,6 +179,9 @@ class KafkaServer(
   override def startup(): Unit = {
     try {
       info("starting")
+
+      //Initialing the mapping for segments stored in S3.
+      S3BackUp.initialiseMapping()
 
       if (isShuttingDown.get)
         throw new IllegalStateException("Kafka server is still shutting down, cannot re-start!")
@@ -730,6 +735,11 @@ class KafkaServer(
         isShuttingDown.set(false)
         CoreUtils.swallow(AppInfoParser.unregisterAppInfo(Server.MetricsPrefix, config.brokerId.toString, metrics), this)
         shutdownLatch.countDown()
+
+        //Save the mapping before server shutdown.
+        S3BackUp.saveMapping()
+        info("Mapping Saved")
+
         info("shut down completed")
       }
     }

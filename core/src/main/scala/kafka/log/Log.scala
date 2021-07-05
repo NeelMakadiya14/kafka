@@ -17,6 +17,8 @@
 
 package kafka.log
 
+import Backup.S3BackUp
+
 import java.io.{File, IOException}
 import java.nio.file.Files
 import java.text.NumberFormat
@@ -1201,56 +1203,77 @@ class Log(@volatile private var _dir: File,
       trace(s"Reading maximum $maxLength bytes at offset $startOffset from log with " +
         s"total length $size bytes")
 
-      val includeAbortedTxns = isolation == FetchTxnCommitted
 
-      // Because we don't use the lock for reading, the synchronization is a little bit tricky.
-      // We create the local variables to avoid race conditions with updates to the log.
-      val endOffsetMetadata = nextOffsetMetadata
-      val endOffset = endOffsetMetadata.messageOffset
-      var segmentOpt = segments.floorSegment(startOffset)
+      info("Entered in read of Log.    LogStartOffset : "+this.logStartOffset+" QueryStartOffset: "+startOffset)
 
-      // return error on attempt to read beyond the log end offset or read below log start offset
-      if (startOffset > endOffset || segmentOpt.isEmpty || startOffset < logStartOffset)
-        throw new OffsetOutOfRangeException(s"Received request for offset $startOffset for partition $topicPartition, " +
-          s"but we only have log segments in the range $logStartOffset to $endOffset.")
+      //if startOffset is less than log base offset then fetch data from S3.
+      if(startOffset < this.logStartOffset){
+        info("given Offset is less than logStartOffset..  So, Fetching from Storage")
+        val baseOffset = S3BackUp.getBaseOffset(topicPartition,startOffset)
 
-      val maxOffsetMetadata = isolation match {
-        case FetchLogEnd => endOffsetMetadata
-        case FetchHighWatermark => fetchHighWatermarkMetadata
-        case FetchTxnCommitted => fetchLastStableOffsetMetadata
+        val logFile = S3BackUp.retrieveLogFile(baseOffset,topicPartition)
+        val indexFile = S3BackUp.retrieveIndexFile(baseOffset,topicPartition)
+
+        val segment = new LogSegment(FileRecords.open(logFile), LazyIndex.forOffset(indexFile,baseOffset,1024),null,null,baseOffset,4096,0,Time.SYSTEM)
+
+        val maxPosition = segment.size
+
+        val fetchDataInfo = segment.read(startOffset, maxLength, maxPosition, minOneMessage)
+
+        fetchDataInfo
       }
+      else{
+        val includeAbortedTxns = isolation == FetchTxnCommitted
 
-      if (startOffset == maxOffsetMetadata.messageOffset)
-        emptyFetchDataInfo(maxOffsetMetadata, includeAbortedTxns)
-      else if (startOffset > maxOffsetMetadata.messageOffset)
-        emptyFetchDataInfo(convertToOffsetMetadataOrThrow(startOffset), includeAbortedTxns)
-      else {
-        // Do the read on the segment with a base offset less than the target offset
-        // but if that segment doesn't contain any messages with an offset greater than that
-        // continue to read from successive segments until we get some messages or we reach the end of the log
-        var fetchDataInfo: FetchDataInfo = null
-        while (fetchDataInfo == null && segmentOpt.isDefined) {
-          val segment = segmentOpt.get
-          val baseOffset = segment.baseOffset
+        // Because we don't use the lock for reading, the synchronization is a little bit tricky.
+        // We create the local variables to avoid race conditions with updates to the log.
+        val endOffsetMetadata = nextOffsetMetadata
+        val endOffset = endOffsetMetadata.messageOffset
+        var segmentOpt = segments.floorSegment(startOffset)
 
-          val maxPosition =
-            // Use the max offset position if it is on this segment; otherwise, the segment size is the limit.
-            if (maxOffsetMetadata.segmentBaseOffset == segment.baseOffset) maxOffsetMetadata.relativePositionInSegment
-            else segment.size
+        // return error on attempt to read beyond the log end offset or read below log start offset
+        if (startOffset > endOffset || segmentOpt.isEmpty || startOffset < logStartOffset)
+          throw new OffsetOutOfRangeException(s"Received request for offset $startOffset for partition $topicPartition, " +
+            s"but we only have log segments in the range $logStartOffset to $endOffset.")
 
-          fetchDataInfo = segment.read(startOffset, maxLength, maxPosition, minOneMessage)
-          if (fetchDataInfo != null) {
-            if (includeAbortedTxns)
-              fetchDataInfo = addAbortedTransactions(startOffset, segment, fetchDataInfo)
-          } else segmentOpt = segments.higherSegment(baseOffset)
+        val maxOffsetMetadata = isolation match {
+          case FetchLogEnd => endOffsetMetadata
+          case FetchHighWatermark => fetchHighWatermarkMetadata
+          case FetchTxnCommitted => fetchLastStableOffsetMetadata
         }
 
-        if (fetchDataInfo != null) fetchDataInfo
+        if (startOffset == maxOffsetMetadata.messageOffset)
+          emptyFetchDataInfo(maxOffsetMetadata, includeAbortedTxns)
+        else if (startOffset > maxOffsetMetadata.messageOffset)
+          emptyFetchDataInfo(convertToOffsetMetadataOrThrow(startOffset), includeAbortedTxns)
         else {
-          // okay we are beyond the end of the last segment with no data fetched although the start offset is in range,
-          // this can happen when all messages with offset larger than start offsets have been deleted.
-          // In this case, we will return the empty set with log end offset metadata
-          FetchDataInfo(nextOffsetMetadata, MemoryRecords.EMPTY)
+          // Do the read on the segment with a base offset less than the target offset
+          // but if that segment doesn't contain any messages with an offset greater than that
+          // continue to read from successive segments until we get some messages or we reach the end of the log
+          var fetchDataInfo: FetchDataInfo = null
+          while (fetchDataInfo == null && segmentOpt.isDefined) {
+            val segment = segmentOpt.get
+            val baseOffset = segment.baseOffset
+
+            val maxPosition =
+            // Use the max offset position if it is on this segment; otherwise, the segment size is the limit.
+              if (maxOffsetMetadata.segmentBaseOffset == segment.baseOffset) maxOffsetMetadata.relativePositionInSegment
+              else segment.size
+
+            fetchDataInfo = segment.read(startOffset, maxLength, maxPosition, minOneMessage)
+            if (fetchDataInfo != null) {
+              if (includeAbortedTxns)
+                fetchDataInfo = addAbortedTransactions(startOffset, segment, fetchDataInfo)
+            } else segmentOpt = segments.higherSegment(baseOffset)
+          }
+
+          if (fetchDataInfo != null) fetchDataInfo
+          else {
+            // okay we are beyond the end of the last segment with no data fetched although the start offset is in range,
+            // this can happen when all messages with offset larger than start offsets have been deleted.
+            // In this case, we will return the empty set with log end offset metadata
+            FetchDataInfo(nextOffsetMetadata, MemoryRecords.EMPTY)
+          }
         }
       }
     }
@@ -2423,6 +2446,13 @@ object Log extends Logging {
       Seq()
 
     def deleteSegments(): Unit = {
+
+      //Taking Backup of .log and .index file before deleting physical copy.
+      segmentsToDelete.foreach(seg=>{
+        info(s"Start Offset = ${seg.baseOffset}   End Offset = ${seg.offsetOfMaxTimestampSoFar}   Find Out = ${seg.readNextOffset}")
+        S3BackUp.uploadFile(topicPartition,seg,seg.baseOffset)
+      })
+
       info(s"${logPrefix}Deleting segment files ${segmentsToDelete.mkString(",")}")
       val parentDir = dir.getParent
       maybeHandleIOException(logDirFailureChannel, parentDir, s"Error while deleting segments for $topicPartition in dir $parentDir") {

@@ -809,6 +809,9 @@ project(':core') {
     implementation project(':raft')
     implementation project(':storage')
 
+    implementation platform('com.amazonaws:aws-java-sdk-bom:1.12.1')
+    implementation 'com.amazonaws:aws-java-sdk-s3'
+
     implementation libs.argparse4j
     implementation libs.jacksonDatabind
     implementation libs.jacksonModuleScala
