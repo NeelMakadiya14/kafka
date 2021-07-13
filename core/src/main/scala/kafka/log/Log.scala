@@ -1203,24 +1203,22 @@ class Log(@volatile private var _dir: File,
       trace(s"Reading maximum $maxLength bytes at offset $startOffset from log with " +
         s"total length $size bytes")
 
-
-      info("Entered in read of Log.    LogStartOffset : "+this.logStartOffset+" QueryStartOffset: "+startOffset)
-
       //if startOffset is less than log base offset then fetch data from S3.
       if(startOffset < this.logStartOffset){
         info("given Offset is less than logStartOffset..  So, Fetching from Storage")
         val baseOffset = S3BackUp.getBaseOffset(topicPartition,startOffset)
 
-        val logFile = S3BackUp.retrieveLogFile(baseOffset,topicPartition)
-        val indexFile = S3BackUp.retrieveIndexFile(baseOffset,topicPartition)
+        val segment = S3BackUp.retrieveSegment(baseOffset,topicPartition)
 
-        val segment = new LogSegment(FileRecords.open(logFile), LazyIndex.forOffset(indexFile,baseOffset,1024),null,null,baseOffset,4096,0,Time.SYSTEM)
-
-        val maxPosition = segment.size
-
-        val fetchDataInfo = segment.read(startOffset, maxLength, maxPosition, minOneMessage)
-
-        fetchDataInfo
+        if(segment!=null){
+          val maxPosition = segment.size
+          val fetchDataInfo = segment.read(startOffset, maxLength, maxPosition, minOneMessage)
+          fetchDataInfo
+        }
+        else {
+          throw new OffsetOutOfRangeException(s"Received request for offset $startOffset for partition $topicPartition, " +
+            s"but we only have log segments in the range $logStartOffset.")
+        }
       }
       else{
         val includeAbortedTxns = isolation == FetchTxnCommitted
@@ -2447,22 +2445,32 @@ object Log extends Logging {
 
     def deleteSegments(): Unit = {
 
+      var allDone = true
+
       //Taking Backup of .log and .index file before deleting physical copy.
       segmentsToDelete.foreach(seg=>{
         info(s"Start Offset = ${seg.baseOffset}   End Offset = ${seg.offsetOfMaxTimestampSoFar}   Find Out = ${seg.readNextOffset}")
-        S3BackUp.uploadFile(topicPartition,seg,seg.baseOffset)
+        val done =  S3BackUp.uploadFile(topicPartition,seg,seg.baseOffset)
+        allDone = allDone && done
       })
 
-      info(s"${logPrefix}Deleting segment files ${segmentsToDelete.mkString(",")}")
-      val parentDir = dir.getParent
-      maybeHandleIOException(logDirFailureChannel, parentDir, s"Error while deleting segments for $topicPartition in dir $parentDir") {
-        segmentsToDelete.foreach { segment =>
-          segment.deleteIfExists()
-        }
-        snapshotsToDelete.foreach { snapshot =>
-          snapshot.deleteIfExists()
+      if(allDone==true){
+        info(s"${logPrefix}Deleting segment files ${segmentsToDelete.mkString(",")}")
+        val parentDir = dir.getParent
+        maybeHandleIOException(logDirFailureChannel, parentDir, s"Error while deleting segments for $topicPartition in dir $parentDir") {
+          segmentsToDelete.foreach { segment =>
+            segment.deleteIfExists()
+          }
+          snapshotsToDelete.foreach { snapshot =>
+            snapshot.deleteIfExists()
+          }
         }
       }
+      else {
+        info("Backup failed hence scheduled again.")
+        scheduler.schedule("delete-file", () => deleteSegments(), delay = config.fileDeleteDelayMs)
+      }
+
     }
 
     if (asyncDelete)

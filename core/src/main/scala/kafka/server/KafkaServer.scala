@@ -17,7 +17,7 @@
 
 package kafka.server
 
-import Backup.S3BackUp
+import Backup.{Config, S3BackUp}
 
 import java.io.{File, IOException}
 import java.net.{InetAddress, SocketTimeoutException}
@@ -182,6 +182,8 @@ class KafkaServer(
 
       //Initialing the mapping for segments stored in S3.
       S3BackUp.initialiseMapping()
+      new Config(config)
+
 
       if (isShuttingDown.get)
         throw new IllegalStateException("Kafka server is still shutting down, cannot re-start!")
